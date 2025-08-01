@@ -2,3 +2,4 @@ TencentGR_1k/
 TencentGR_1k.zip
 tensorboard/
 checkpoints/
+__pycache__
