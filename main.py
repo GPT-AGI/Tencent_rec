@@ -217,6 +217,9 @@ if __name__ == '__main__':
         save_dir.mkdir(parents=True, exist_ok=True)
         torch.save(model.state_dict(), save_dir / "model.pt")
 
+        # 更新hard negative池
+        dataset.update_hard_negative_pool(model, args.device)
+
     print("Done")
     writer.close()
     log_file.close()

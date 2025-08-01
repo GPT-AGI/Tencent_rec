@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from tqdm import tqdm
+import time
 
 
 class MyDataset(torch.utils.data.Dataset):
@@ -51,6 +52,7 @@ class MyDataset(torch.utils.data.Dataset):
         self.indexer_i_rev = {v: k for k, v in indexer['i'].items()}
         self.indexer_u_rev = {v: k for k, v in indexer['u'].items()}
         self.indexer = indexer
+        self.hard_negative_pool = {}  # 用户个性化hard negative池
 
         self.feature_default_value, self.feature_types, self.feat_statistics = self._init_feat_info()
 
@@ -93,6 +95,65 @@ class MyDataset(torch.utils.data.Dataset):
         while t in s or str(t) not in self.item_feat_dict:
             t = np.random.randint(l, r)
         return t
+
+    def update_hard_negative_pool(self, model, device):
+        """
+        用当前模型为每个用户采集top5 hard negative，存入self.hard_negative_pool。
+        """
+        model.eval()
+        print("[INFO] Updating hard negative pool...")
+        for uid in range(self.usernum):
+            user_data = self._load_user_data(uid)
+            # 获取用户历史正样本item集合
+            pos_items = set()
+            for record in user_data:
+                if record[1]:
+                    pos_items.add(record[1])
+            # 取全部item或采样部分item作为候选
+            candidate_items = [i for i in range(1, self.itemnum+1) if i not in pos_items]
+            if len(candidate_items) > 200:
+                candidate_items = np.random.choice(candidate_items, 200, replace=False)
+            # 获取用户embedding
+            ext_user_sequence = []
+            for record_tuple in user_data:
+                u, i, user_feat, item_feat, action_type, _ = record_tuple
+                if u and user_feat:
+                    ext_user_sequence.insert(0, (u, user_feat, 2, action_type))
+                if i and item_feat:
+                    ext_user_sequence.append((i, item_feat, 1, action_type))
+            seq = np.zeros([self.maxlen + 1], dtype=np.int32)
+            token_type = np.zeros([self.maxlen + 1], dtype=np.int32)
+            seq_feat = np.empty([self.maxlen + 1], dtype=object)
+            idx = self.maxlen
+            for record_tuple in reversed(ext_user_sequence[:-1]):
+                i, feat, type_, act_type = record_tuple
+                feat = self.fill_missing_feat(feat, i)
+                seq[idx] = i
+                token_type[idx] = type_
+                seq_feat[idx] = feat
+                idx -= 1
+                if idx == -1:
+                    break
+            seq_feat = np.where(seq_feat == None, self.feature_default_value, seq_feat)
+            seq = torch.from_numpy(seq).unsqueeze(0).to(device)
+            token_type = torch.from_numpy(token_type).unsqueeze(0).to(device)
+            seq_feat = [seq_feat]
+            with torch.no_grad():
+                user_emb = model.predict(seq, seq_feat, token_type)  # [1, hidden]
+            # 构造候选item embedding
+            item_feats = []
+            for item_id in candidate_items:
+                item_feat = self.fill_missing_feat(self.item_feat_dict[str(item_id)], item_id)
+                item_feats.append(item_feat)
+            item_ids = torch.tensor(candidate_items, device=device).unsqueeze(0)
+            item_feats = [np.array(item_feats, dtype=object)]
+            with torch.no_grad():
+                item_embs = model.feat2emb(item_ids, item_feats, include_user=False).squeeze(0)  # [N, hidden]
+                scores = (user_emb @ item_embs.T).squeeze(0).cpu().numpy()  # [N]
+            topk_idx = np.argsort(scores)[-5:][::-1]
+            hard_negs = [candidate_items[i] for i in topk_idx]
+            self.hard_negative_pool[uid] = hard_negs
+        print("[INFO] Hard negative pool updated.")
 
     def __getitem__(self, uid):
         """
@@ -139,7 +200,7 @@ class MyDataset(torch.utils.data.Dataset):
         for record_tuple in ext_user_sequence:
             if record_tuple[2] == 1 and record_tuple[0]:
                 ts.add(record_tuple[0])
-        breakpoint()
+        #breakpoint()
         # left-padding, 从后往前遍历，将用户序列填充到maxlen+1的长度
         for record_tuple in reversed(ext_user_sequence[:-1]):
             i, feat, type_, act_type = record_tuple
@@ -155,9 +216,20 @@ class MyDataset(torch.utils.data.Dataset):
             if next_type == 1 and next_i != 0:
                 pos[idx] = next_i
                 pos_feat[idx] = next_feat
-                neg_id = self._random_neq(1, self.itemnum + 1, ts)
-                neg[idx] = neg_id
-                neg_feat[idx] = self.fill_missing_feat(self.item_feat_dict[str(neg_id)], neg_id)
+                # hard negative采样
+                hard_neg_id = None
+                if uid in self.hard_negative_pool and self.hard_negative_pool[uid]:
+                    hard_neg_id = np.random.choice(self.hard_negative_pool[uid], 1)[0]
+                neg_ids = []
+                if hard_neg_id is not None:
+                    neg_ids.append(hard_neg_id)
+                # 其余用随机采样补足
+                for _ in range(5 - len(neg_ids)):
+                    neg_id = self._random_neq(1, self.itemnum + 1, ts)
+                    neg_ids.append(neg_id)
+                # 只用第一个负样本（兼容原有代码结构），如需多负样本可扩展
+                neg[idx] = neg_ids[0]
+                neg_feat[idx] = self.fill_missing_feat(self.item_feat_dict[str(neg_ids[0])], neg_ids[0])
             nxt = record_tuple
             idx -= 1
             if idx == -1:
@@ -166,7 +238,7 @@ class MyDataset(torch.utils.data.Dataset):
         seq_feat = np.where(seq_feat == None, self.feature_default_value, seq_feat)
         pos_feat = np.where(pos_feat == None, self.feature_default_value, pos_feat)
         neg_feat = np.where(neg_feat == None, self.feature_default_value, neg_feat)
-        breakpoint()
+        #breakpoint()
         return seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat
 
     def __len__(self):
@@ -386,7 +458,7 @@ class MyTestDataset(MyDataset):
                 break
 
         seq_feat = np.where(seq_feat == None, self.feature_default_value, seq_feat)
-        breakpoint()
+        #breakpoint()
         return seq, token_type, seq_feat, user_id
 
     def __len__(self):
@@ -436,44 +508,52 @@ def save_emb(emb, save_path):
         emb.tofile(f)
 
 
-def load_mm_emb(mm_path, feat_ids,args):
+def load_mm_emb(mm_path, feat_ids, args):
     """
     加载多模态特征Embedding
-
-    Args:
-        mm_path: 多模态特征Embedding路径
-        feat_ids: 要加载的多模态特征ID列表
-
-    Returns:
-        mm_emb_dict: 多模态特征Embedding字典，key为特征ID，value为特征Embedding字典（key为item ID，value为Embedding）
     """
+    import os
     SHAPE_DICT = {"81": 32, "82": 1024, "83": 3584, "84": 4096, "85": 3584, "86": 3584}
     mm_emb_dict = {}
+    log_path = os.environ.get('TRAIN_LOG_PATH', '.')
+    log_file = open(os.path.join(log_path, 'train.log'), 'a')
     for feat_id in tqdm(feat_ids, desc='Loading mm_emb'):
         shape = SHAPE_DICT[feat_id]
         emb_dict = {}
-        print('feat_id', feat_id!='81')
+        start_time = time.time()
+        log_file.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Start loading feat_id {feat_id}\n")
+        log_file.flush()
         if feat_id != '81':
             try:
                 base_path = Path(mm_path, f'emb_{feat_id}_{shape}')
-                if args.local_test: 
-                    glob_list = base_path.glob('part-*') 
-                else:   
-                    glob_list = base_path.glob('*.json')
-                for json_file in glob_list:
+                glob_list = list(base_path.glob('*.json'))
+                if not glob_list:
+                    glob_list = list(base_path.glob('part-*'))
+                total_files = len(glob_list)
+                for idx, json_file in enumerate(glob_list):
                     with open(json_file, 'r', encoding='utf-8') as file:
-                        for line in file:
+                        for line_num, line in enumerate(file):
                             data_dict_origin = json.loads(line.strip())
                             insert_emb = data_dict_origin['emb']
                             if isinstance(insert_emb, list):
                                 insert_emb = np.array(insert_emb, dtype=np.float32)
                             data_dict = {data_dict_origin['anonymous_cid']: insert_emb}
                             emb_dict.update(data_dict)
+                            if (line_num+1) % 100000 == 0:
+                                log_file.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] feat_id {feat_id} file {idx+1}/{total_files} loaded {line_num+1} lines\n")
+                                log_file.flush()
+                    if (idx+1) % 10 == 0 or idx+1 == total_files:
+                        log_file.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] feat_id {feat_id} loaded {idx+1}/{total_files} files\n")
+                        log_file.flush()
             except Exception as e:
-                print(f"transfer error: {e}")
+                log_file.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] transfer error: {e}\n")
+                log_file.flush()
         if feat_id == '81':
             with open(Path(mm_path, f'emb_{feat_id}_{shape}.pkl'), 'rb') as f:
                 emb_dict = pickle.load(f)
         mm_emb_dict[feat_id] = emb_dict
-        print(f'Loaded #{feat_id} mm_emb')
+        elapsed = time.time() - start_time
+        log_file.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Loaded #{feat_id} mm_emb, total keys: {len(emb_dict)}, time: {elapsed:.1f}s\n")
+        log_file.flush()
+    log_file.close()
     return mm_emb_dict
